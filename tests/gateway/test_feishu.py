@@ -4944,3 +4944,19 @@ class TestChatLockEviction(unittest.TestCase):
                 held.release()
 
         asyncio.run(_run())
+
+
+class TestFeishuInboundMarkdownV2(unittest.TestCase):
+    """M2: 入站优先取 content_v2 + 渲染层 tag==md 原文直出。"""
+
+    # --- Task 1: tag==md 原文直出 ---
+    def test_render_md_element_raw_passthrough(self):
+        # AC-M2-H2: tag=="md" 元素原文直出、不转义（表格 markdown 的 | 等字符保留）。
+        from gateway.platforms.feishu import _render_post_element
+
+        md_table = "| Name | Age |\n|------|-----|\n| Bob | 30 |"
+        out = _render_post_element({"tag": "md", "text": md_table}, [], [])
+        self.assertEqual(out, md_table)
+        # 未被 markdown 转义：管道符 / 连字符原样保留，无反斜杠转义。
+        self.assertNotIn("\\|", out)
+        self.assertNotIn("\\-", out)

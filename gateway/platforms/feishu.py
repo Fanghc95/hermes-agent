@@ -760,6 +760,11 @@ def _render_post_element(
         return _wrap_inline_code(code) if code else ""
     if tag in {"code_block", "pre"}:
         return _render_code_block_element(element)
+    if tag == "md":
+        # content_v2 markdown element: emit the raw markdown text verbatim so
+        # tables / code / headings keep their structure. Must come before the
+        # nested fallback, which would escape it via _escape_markdown_text.
+        return str(element.get("text", "") or "")
 
     nested_parts: List[str] = []
     for key in ("text", "title", "content", "children", "elements"):
