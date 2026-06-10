@@ -4944,3 +4944,91 @@ class TestChatLockEviction(unittest.TestCase):
                 held.release()
 
         asyncio.run(_run())
+
+
+class TestFeishuOutboundMarkdownTable(unittest.TestCase):
+    """M1: 含表格的出站内容与其它 markdown 一视同仁走 post+tag=md。"""
+
+    def _adapter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        return FeishuAdapter(PlatformConfig())
+
+    def test_table_content_goes_to_post_md(self):
+        # AC-M1-H1: 含 markdown 表格 → msg_type=="post"，rows 为 tag=="md" 且含表格原文。
+        adapter = self._adapter()
+        content = "| Name | Age |\n|------|-----|\n| Bob | 30 |"
+        msg_type, payload = adapter._build_outbound_payload(content)
+        self.assertEqual(msg_type, "post")
+        parsed = json.loads(payload)
+        rows = parsed["zh_cn"]["content"]
+        flat = [el for row in rows for el in row]
+        self.assertTrue(all(el["tag"] == "md" for el in flat))
+        self.assertIn("| Name | Age |", "".join(el["text"] for el in flat))
+
+    def test_plain_text_stays_text(self):
+        # AC-M1-H2: 纯文本 → msg_type=="text"，payload 为 {"text": content}。
+        adapter = self._adapter()
+        content = "just a plain sentence without markdown"
+        msg_type, payload = adapter._build_outbound_payload(content)
+        self.assertEqual(msg_type, "text")
+        self.assertEqual(json.loads(payload), {"text": content})
+
+    def test_non_table_markdown_stays_post(self):
+        # AC-M1-H3: 含非表格 md（标题/列表/加粗）→ 仍走 post+md（行为不变）。
+        adapter = self._adapter()
+        content = "# 标题\n\n- 列表项\n\n可以用 **粗体**。"
+        msg_type, payload = adapter._build_outbound_payload(content)
+        self.assertEqual(msg_type, "post")
+        parsed = json.loads(payload)
+        flat = [el for row in parsed["zh_cn"]["content"] for el in row]
+        self.assertTrue(all(el["tag"] == "md" for el in flat))
+
+    def test_fenced_code_block_still_splits_rows(self):
+        # AC-M1-E1: 含围栏代码块 → 仍按既有逻辑拆为多 post row（行为不变）。
+        adapter = self._adapter()
+        content = "前言文字\n\n```python\nprint('x')\n```\n\n收尾文字"
+        msg_type, payload = adapter._build_outbound_payload(content)
+        self.assertEqual(msg_type, "post")
+        rows = json.loads(payload)["zh_cn"]["content"]
+        self.assertGreater(len(rows), 1)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_table_post_rejected_falls_back_to_text(self):
+        # AC-M1-R1: 表格构造出 post，被飞书 API 以 post content invalid 拒绝 →
+        # 复用既有回退分支以 msg_type=="text" 重发，不抛错给上层。
+        adapter = self._adapter()
+        captured = {"calls": []}
+
+        class _MessageAPI:
+            def update(self, request):
+                captured["calls"].append(request)
+                if len(captured["calls"]) == 1:
+                    return SimpleNamespace(
+                        success=lambda: False,
+                        code=230001,
+                        msg="content format of the post type is incorrect",
+                    )
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        content = "| Name | Age |\n|------|-----|\n| Bob | 30 |"
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="om_progress",
+                    content=content,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
