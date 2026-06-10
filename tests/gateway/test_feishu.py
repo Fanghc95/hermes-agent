@@ -4960,3 +4960,100 @@ class TestFeishuInboundMarkdownV2(unittest.TestCase):
         # 未被 markdown 转义：管道符 / 连字符原样保留，无反斜杠转义。
         self.assertNotIn("\\|", out)
         self.assertNotIn("\\-", out)
+
+    # --- Task 2: content_v2 优先 + 防御式降级 ---
+    def _post_raw(self, payload: dict) -> str:
+        return json.dumps(payload, ensure_ascii=False)
+
+    def test_content_v2_preferred_over_legacy_content(self):
+        # AC-M2-H1: 含合法 content_v2 时，取 content_v2 的 md 原文作为 text_content。
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        md_table = "| Name | Age |\n|------|-----|\n| Bob | 30 |"
+        payload = {
+            "content": [[{"tag": "text", "text": "legacy plain"}]],
+            "content_v2": [[{"tag": "md", "text": md_table}]],
+        }
+        normalized = normalize_feishu_message(
+            message_type="post",
+            raw_content=self._post_raw(payload),
+        )
+        self.assertEqual(normalized.text_content, md_table)
+        self.assertNotIn("legacy plain", normalized.text_content)
+
+    def test_content_v2_inside_locale_wrapper(self):
+        # AC-M2-H1: content_v2 位于 locale（zh_cn）包裹层时同样被优先取用。
+        # NOTE: 每行经既有 _normalize_feishu_text 处理（会丢空行），故此用例用单行
+        # 表格 markdown 验证 content_v2 优先，避免依赖出域的空行保留行为。
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        md = "| 名称 | 年龄 |"
+        payload = {"zh_cn": {
+            "content": [[{"tag": "text", "text": "legacy"}]],
+            "content_v2": [[{"tag": "md", "text": md}]],
+        }}
+        normalized = normalize_feishu_message(
+            message_type="post",
+            raw_content=self._post_raw(payload),
+        )
+        self.assertEqual(normalized.text_content, md)
+        self.assertNotIn("legacy", normalized.text_content)
+
+    def test_no_content_v2_falls_back_to_content(self):
+        # AC-M2-H3: 无 content_v2 → 降级用传统 content，行为与改造前一致。
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        payload = {"content": [[{"tag": "text", "text": "hello legacy"}]]}
+        normalized = normalize_feishu_message(
+            message_type="post",
+            raw_content=self._post_raw(payload),
+        )
+        self.assertEqual(normalized.text_content, "hello legacy")
+
+    def test_empty_or_non_list_content_v2_falls_back(self):
+        # AC-M2-E1: content_v2 为空 list / 非 list → 安全降级回 content，不报错。
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        for bad_v2 in ([], {"not": "a list"}, 123):
+            payload = {
+                "content": [[{"tag": "text", "text": "legacy ok"}]],
+                "content_v2": bad_v2,
+            }
+            normalized = normalize_feishu_message(
+                message_type="post",
+                raw_content=self._post_raw(payload),
+            )
+            self.assertEqual(normalized.text_content, "legacy ok")
+
+    def test_outbound_contract_single_text_content(self):
+        # AC-M2-E2: 对外仍单一 text_content（post 契约不变，无新增对外字段）。
+        from gateway.platforms.feishu import normalize_feishu_message, FeishuNormalizedMessage
+        import dataclasses
+
+        md = "| a | b |\n|---|---|\n| 1 | 2 |"
+        payload = {"content_v2": [[{"tag": "md", "text": md}]]}
+        normalized = normalize_feishu_message(
+            message_type="post",
+            raw_content=self._post_raw(payload),
+        )
+        self.assertIsInstance(normalized, FeishuNormalizedMessage)
+        self.assertEqual(normalized.raw_type, "post")
+        self.assertEqual(normalized.text_content, md)
+        # 字段集合未因 content_v2 新增对外字段（与既有 dataclass 契约一致）。
+        field_names = {f.name for f in dataclasses.fields(FeishuNormalizedMessage)}
+        self.assertIn("text_content", field_names)
+        self.assertNotIn("content_v2", field_names)
+
+    def test_malformed_content_v2_string_degrades_without_raising(self):
+        # AC-M2-R1: content_v2 为非法 JSON 字符串 / 取用抛异常 → 捕获降级回 content，绝不抛错。
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        payload = {
+            "content": [[{"tag": "text", "text": "safe legacy"}]],
+            "content_v2": "{not-valid-json",
+        }
+        normalized = normalize_feishu_message(
+            message_type="post",
+            raw_content=self._post_raw(payload),
+        )
+        self.assertEqual(normalized.text_content, "safe legacy")

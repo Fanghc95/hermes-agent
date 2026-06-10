@@ -677,10 +677,29 @@ def _resolve_locale_payload(payload: Any) -> Dict[str, Any]:
     return {}
 
 
+def _select_post_content(candidate: Dict[str, Any]) -> Any:
+    """Prefer inbound content_v2 (markdown-native), fall back to legacy content.
+
+    content_v2 shares the legacy post format (a list of element rows) plus an
+    extra tag=="md" element type, so it flows through the existing render path.
+    Any malformed / empty / non-list / exception case degrades silently to the
+    legacy content (AC-M2-E1 / AC-M2-R1): never raise to the caller.
+    """
+    try:
+        raw_v2 = candidate.get("content_v2")
+        if isinstance(raw_v2, str):
+            raw_v2 = json.loads(raw_v2)
+        if isinstance(raw_v2, list) and raw_v2:
+            return raw_v2
+    except Exception:
+        pass
+    return candidate.get("content")
+
+
 def _to_post_payload(candidate: Any) -> Dict[str, Any]:
     if not isinstance(candidate, dict):
         return {}
-    content = candidate.get("content")
+    content = _select_post_content(candidate)
     if not isinstance(content, list):
         return {}
     return {
